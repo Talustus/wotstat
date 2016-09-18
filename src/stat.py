@@ -14,14 +14,18 @@ import threading
 from Account import Account
 from account_helpers import BattleResultsCache
 from items import vehicles as vehiclesWG
-from functools import partial
-from gui.shared.utils.requesters import StatsRequester
 from helpers import i18n
 from notification.NotificationListView import NotificationListView
+from notification.NotificationPopUpViewer import NotificationPopUpViewer
 from messenger import MessengerEntry
 from messenger.formatters.service_channel import BattleResultsFormatter
 from Queue import Queue
 from debug_utils import *
+
+GENERAL = 0
+BY_TANK = 1
+
+#BattleResultsCache.clean = lambda *args: None
 
 def hexToRgb(hex):
     return [int(hex[i:i+2], 16) for i in range(1,6,2)]
@@ -37,7 +41,8 @@ def gradColor(startColor, endColor, val):
 class SessionStatistic(object):
 
     def __init__(self):
-        self.cacheVersion = 5
+        self.page = GENERAL
+        self.cacheVersion = 6
         self.queue = Queue()
         self.loaded = False
         self.configIsValid = True
@@ -50,8 +55,10 @@ class SessionStatistic(object):
         self.values = {}
         self.battles = []
         self.battleStatPatterns = []
-        self.message = ''
+        self.messageGeneral = ''
+        self.messageByTank = ''
         self.playerName = ''
+        self.bgIcon = ''
         self.startDate = None
         self.battleResultsAvailable = threading.Event()
         self.battleResultsAvailable.clear()
@@ -72,9 +79,9 @@ class SessionStatistic(object):
         for vl in vals:
             path = vl.asString + '/scripts/client/mods/'
             if os.path.isdir(path):
-                self.configFilePath = path + 'stat_config.json'
-                self.statCacheFilePath = path + 'stat_cache.json'
-                expectedValuesPath = path + 'expected_tank_values.json'
+                self.configFilePath = path + 'wotstat/config.json'
+                self.statCacheFilePath = path + 'wotstat/cache.json'
+                expectedValuesPath = path + 'wotstat/expected_tank_values.json'
                 if os.path.isfile(self.configFilePath):
                     break
         self.readConfig()
@@ -92,7 +99,8 @@ class SessionStatistic(object):
                 self.startDate = self.cache.get('date', self.getWorkDate())
                 if self.cache.get('version', 0) == self.cacheVersion and \
                     (self.startDate == self.getWorkDate() or \
-                    not self.config.get('dailyAutoReset', True)):
+                    not self.config.get('dailyAutoReset', True)) and \
+                    not self.config.get('clientReloadReset', False):
                     if self.cache.get('players', {}).has_key(self.playerName):
                         self.battles = self.cache['players'][self.playerName]['battles']
                     invalidCache = False
@@ -107,8 +115,15 @@ class SessionStatistic(object):
                 self.battleStatPatterns = []
                 for pattern in self.config.get('battleStatPatterns',[]):
                     try:
+                        condition = pattern.get('if', 'True')
+                        condition = re.sub('{{(\w+)}}', 'values[\'\\1\']', condition)
+                    except:
+                        print "[wotstat] Invalid condition " + pattern.get('if','')
+                        continue
+                    try:
                         compiled = re.compile(pattern.get('pattern',''))
                         self.battleStatPatterns.append({
+                            'condition': condition,
                             'pattern': compiled,
                             'repl': pattern.get('repl','')
                         })
@@ -139,22 +154,37 @@ class SessionStatistic(object):
         statCache.close()
 
     def createMessage(self):
+        messages = {
+                GENERAL: self.messageGeneral, 
+                BY_TANK: self.messageByTank
+            }
+        msg = messages[self.page]
         message = {
             'typeID': 1,
             'message': {
-                'bgIcon':  self.config.get('bgIcon', ''),
+                'bgIcon': self.bgIcon,
                 'defaultIcon': '',
-                'savedID': 0,
+                'savedData': 0,
                 'timestamp': -1,
                 'filters': [],
                 'buttonsLayout': [],
-                'message': self.message,
+                'message': msg,
                 'type': 'black',
-                'icon': '../maps/icons/library/PersonalAchievementsIcon-1.png',
+                'icon': self.config.get('icon', "../maps/icons/library/BattleResultIcon-1.png"),
             },
             'entityID': 99999,
             'auxData': ['GameGreeting']
         }
+        if len(self.battles) and self.config.get('showStatByTank', True):
+            buttonNames = {
+                GENERAL: self.config.get('textGeneralPageButton', 'By tank'), 
+                BY_TANK: self.config.get('textByTankPageButton', 'General')
+            }
+            message['message']['buttonsLayout'].append({
+                'action': 'wotstatSwitchPage',
+                'type': 'submit',
+                'label': buttonNames[self.page]
+            })
         if self.config.get('showResetButton', False):
             message['message']['buttonsLayout'].append({
                 'action': 'wotstatReset',
@@ -163,73 +193,88 @@ class SessionStatistic(object):
             })
         return message
 
-    def addLaterArenaUniqueID(self, arenaUniqueID):
-        self.queue.put(arenaUniqueID)
-
     def battleResultsCallback(self, arenaUniqueID, responseCode, value = None, revision = 0):
         if responseCode == AccountCommands.RES_NON_PLAYER or responseCode == AccountCommands.RES_COOLDOWN:
-            addArenaUniqueID = partial(self.addLaterArenaUniqueID, arenaUniqueID)
-            BigWorld.callback(1.0, addArenaUniqueID)
+            BigWorld.callback(1.0, lambda: self.queue.put(arenaUniqueID))
             self.battleResultsBusy.release()
             return
-        if responseCode < 0 or value['common']['guiType'] in self.config.get('ignoreBattleType', []):
+        if responseCode < 0:
             self.battleResultsBusy.release()
             return
-        vehicleCompDesc = value['personal']['typeCompDescr']
+        arenaTypeID = value['common']['arenaTypeID']
+        arenaType = ArenaType.g_cache[arenaTypeID]
+        personal = value['personal'].itervalues().next()
+        vehicleCompDesc = personal['typeCompDescr']
         vt = vehiclesWG.getVehicleType(vehicleCompDesc)
-        result = 1 if int(value['personal']['team']) == int(value['common']['winnerTeam'])\
+        result = 1 if int(personal['team']) == int(value['common']['winnerTeam'])\
             else (0 if not int(value['common']['winnerTeam']) else -1)
-        battleTier = 1
         place = 1
         arenaUniqueID = value['arenaUniqueID']
+        squadsTier = {}
         vehicles = value['vehicles']
-        for key in vehicles.keys():
-            pTypeCompDescr = vehicles[key]['typeCompDescr']
+        for vehicle in vehicles.values():
+            pTypeCompDescr = vehicle[0]['typeCompDescr']
             if pTypeCompDescr is not None:
                 pvt = vehiclesWG.getVehicleType(pTypeCompDescr)
-                battleTier = max(battleTier, pvt.level)
-            if value['personal']['team'] == vehicles[key]['team'] and \
-                value['personal']['originalXP'] < vehicles[key]['xp']:
+                tier = pvt.level
+                if set(vehiclesWG.VEHICLE_CLASS_TAGS.intersection(pvt.tags)).pop() == 'lightTank' and tier > 5:
+                    tier += 1
+                squadId = value['players'][vehicle[0]['accountDBID']]['prebattleID']
+                squadsTier[squadId] = max(squadsTier.get(squadId, 0), tier)
+            if personal['team'] == vehicle[0]['team'] and \
+                personal['originalXP'] < vehicle[0]['xp']:
                 place += 1
-        proceeds = value['personal']['credits'] - value['personal']['autoRepairCost'] -\
-                   value['personal']['autoEquipCost'][0] - value['personal']['autoLoadCost'][0]
+        battleTier = 11 if max(squadsTier.values()) == 10 and min(squadsTier.values()) == 9 \
+            else max(squadsTier.values())
+        proceeds = personal['credits'] - personal['autoRepairCost'] -\
+                   personal['autoEquipCost'][0] - personal['autoLoadCost'][0]
+        tmenXP = personal['tmenXP']
+        if 'premium' in vt.tags:
+            tmenXP = int(1.5*tmenXP)
         battle = {
             'idNum': vehicleCompDesc,
-            'name': vt.name.replace(':', '-'),
+            'map': arenaType.geometryName,
+            'vehicle': vt.name.replace(':', '-'),
             'tier': vt.level,
             'result': result,
-            'damage': value['personal']['damageDealt'],
-            'frag': value['personal']['kills'],
-            'spot': value['personal']['spotted'],
-            'def': value['personal']['droppedCapturePoints'],
-            'cap': value['personal']['capturePoints'],
-            'shots': value['personal']['shots'],
-            'hits': value['personal']['directHits'],
-            'pierced': value['personal']['piercings'],
-            'xp': value['personal']['xp'],
-            'originalXP': value['personal']['originalXP'],
+            'damage': personal['damageDealt'],
+            'frag': personal['kills'],
+            'spot': personal['spotted'],
+            'def': personal['droppedCapturePoints'],
+            'cap': personal['capturePoints'],
+            'shots': personal['shots'],
+            'hits': personal['directHits'],
+            'pierced': personal['piercings'],
+            'xp': personal['xp'],
+            'originalXP': personal['originalXP'],
+            'freeXP': personal['freeXP'],
             'place': place,
             'credits': proceeds,
-            'gold': value['personal']['gold'] - value['personal']['autoEquipCost'][1] - value['personal']['autoLoadCost'][1],
+            'gold': personal['gold'] - personal['autoEquipCost'][1] - personal['autoLoadCost'][1],
             'battleTier': battleTier,
-            'assist': value['personal']['damageAssistedRadio'] + value['personal']['damageAssistedTrack']
+            'assist': personal['damageAssistedRadio'] + personal['damageAssistedTrack'],
+            'assistRadio': personal['damageAssistedRadio'],
+            'assistTrack': personal['damageAssistedTrack']
         }
         extended = {
+            'vehicle': battle['vehicle'],
+            'map': battle['map'],
             'result': result,
-            'autoRepair': value['personal']['autoRepairCost'],
-            'autoEquip': value['personal']['autoEquipCost'][0],
-            'autoLoad': value['personal']['autoLoadCost'][0]
+            'autoRepair': personal['autoRepairCost'],
+            'autoEquip': personal['autoEquipCost'][0],
+            'autoLoad': personal['autoLoadCost'][0],
+            'tmenXP': tmenXP
         }
         if self.config.get('dailyAutoReset', True) and self.startDate != stat.getWorkDate():
             self.reset()
-        self.battles.append(battle)
-        self.save()
-        self.updateMessage()
-        battleStat = {}
-        gradient = {}
-        palette = {}
-        self.calcWN8([battle], battleStat, gradient, palette)
-        self.refreshColorMacros(extended, gradient, palette)
+        if value['common']['guiType'] not in self.config.get('ignoreBattleType', []):
+            self.battles.append(battle)
+            self.save()
+            self.updateMessage()
+        (battleStat, gradient, palette) = self.calcWN8([battle])
+        (extGradient, extPalette) = self.refreshColorMacros(extended)
+        gradient.update(extGradient)
+        palette.update(extPalette)
         self.battleStats[arenaUniqueID] = {}
         self.battleStats[arenaUniqueID]['values'] = battleStat
         self.battleStats[arenaUniqueID]['extendedValues'] = extended
@@ -238,6 +283,7 @@ class SessionStatistic(object):
         self.battleResultsBusy.release()
 
     def reset(self):
+        self.page = GENERAL
         self.startDate = self.getWorkDate()
         self.battles = []
         self.save()
@@ -246,17 +292,19 @@ class SessionStatistic(object):
     def mainLoop(self):
         while True:
             arenaUniqueID = self.queue.get()
-            stat.battleResultsAvailable.wait()
+            self.battleResultsAvailable.wait()
             self.battleResultsBusy.acquire()
-            shotBRCallback = partial(self.battleResultsCallback, arenaUniqueID)
-            BigWorld.player().battleResultsCache.get(arenaUniqueID, shotBRCallback)
+            BigWorld.player().battleResultsCache.get(arenaUniqueID,\
+                lambda resID, value: self.battleResultsCallback(arenaUniqueID, resID, value, None))
 
-    def refreshColorMacros(self, values, gradient, palette):
+    def refreshColorMacros(self, values):
+        gradient = {}
+        palette = {}
         if values.get('battlesCount', 1) == 0:
             for key in values.keys():
                 gradient[key] = '#FFFFFF'
                 palette[key] = '#FFFFFF'
-            return
+            return (gradient, palette)
         for key in values.keys():
             if self.config.get('gradient', {}).has_key(key):
                 colors = self.config.get('gradient', {})[key]
@@ -280,12 +328,13 @@ class SessionStatistic(object):
                 colors = self.config.get('palette', {})[key]
                 palette[key] = colors[-1]['color']
                 for item in reversed(colors):
-                    if values[key] <= item['value']:
+                    if values[key] < item['value']:
                         palette[key] = item['color']
                     else:
                         break
             else:
                 palette[key] = '#FFFFFF'
+        return (gradient, palette)
 
     def calcExpected(self, newIdNum):
         v = vehiclesWG.getVehicleType(newIdNum)
@@ -298,7 +347,10 @@ class SessionStatistic(object):
         typeExpected = {}
         typeExpectedCount = 0.0
         for idNum in self.expectedValues:
-            vt = vehiclesWG.getVehicleType(idNum)
+            try:
+                vt = vehiclesWG.getVehicleType(idNum)
+            except:
+                continue
             if vt.level == newTier:
                 tierExpectedCount += 1
                 vType = set(vehiclesWG.VEHICLE_CLASS_TAGS.intersection(vt.tags)).pop()
@@ -317,7 +369,8 @@ class SessionStatistic(object):
             tierExpected[key] /= tierExpectedCount
         self.expectedValues[newIdNum] = tierExpected.copy()
 
-    def calcWN8(self, battles, values, gradient, palette):
+    def calcWN8(self, battles):
+        values = {}
         values['battlesCount'] = len(battles)
         totalTier = 0
         totalPlace = 0
@@ -325,7 +378,8 @@ class SessionStatistic(object):
         totalBattleTier = 0
         valuesKeys = ['winsCount', 'defeatsCount', 'drawsCount', 'totalDmg', 'totalFrag', 'totalSpot',\
             'totalDef', 'totalCap', 'totalShots', 'totalHits', 'totalPierced', 'totalAssist',\
-            'totalXP', 'totalOriginXP', 'credits', 'gold']
+            'totalXP', 'totalOriginXP', 'totalFreeXP', 'credits', 'gold',\
+            'totalAssistRadio', 'totalAssistTrack']
         for key in valuesKeys:
             values[key] = 0
         expKeys = ['expDamage', 'expFrag', 'expSpot', 'expDef', 'expWinRate']
@@ -344,8 +398,11 @@ class SessionStatistic(object):
             values['totalHits'] += battle['hits']
             values['totalPierced'] += battle['pierced']
             values['totalAssist'] += battle['assist']
+            values['totalAssistRadio'] += battle['assistRadio']
+            values['totalAssistTrack'] += battle['assistTrack']
             values['totalXP'] += battle['xp']
             values['totalOriginXP'] += battle['originalXP']
+            values['totalFreeXP'] += battle['freeXP']
             values['credits'] += battle['credits']
             values['gold'] += battle['gold']
             totalTier += battle['tier']
@@ -370,8 +427,11 @@ class SessionStatistic(object):
             values['avgHitsRate'] = float(values['totalHits'])/max(1, values['totalShots'])*100
             values['avgEffHitsRate'] = float(values['totalPierced'])/max(1, values['totalHits'])*100
             values['avgAssist'] = int(values['totalAssist'])/values['battlesCount']
+            values['avgAssistRadio'] = int(values['totalAssistRadio'])/values['battlesCount']
+            values['avgAssistTrack'] = int(values['totalAssistTrack'])/values['battlesCount']
             values['avgXP'] = int(values['totalXP']/values['battlesCount'])
             values['avgOriginalXP'] = int(values['totalOriginXP']/values['battlesCount'])
+            values['avgPremXP'] = int(1.5*values['avgOriginalXP'])
             values['avgCredits'] = int(values['credits']/values['battlesCount'])
             values['avgTier'] = float(totalTier)/values['battlesCount']
             values['avgBattleTier'] = float(totalBattleTier)/values['battlesCount']
@@ -398,10 +458,21 @@ class SessionStatistic(object):
                 else int(max(min(values['EFF']*(values['EFF']*(values['EFF']*(values['EFF']*\
                 (values['EFF']*(0.00000000000000003388*values['EFF'] - 0.0000000000002469) + \
                 0.00000000069335) - 0.00000095342) + 0.0006656) -0.1485) - 0.85, 100), 0))
+            values['BR'] = max(0, int(values['avgDamage']*(0.2 + 1.5/values['avgTier']) + \
+                values['avgFrag'] * (350 - values['avgTier'] * 20) + \
+                ((values['avgAssistRadio']/2)*(0.2 + 1.5/values['avgTier'])) + \
+                ((values['avgAssistTrack']/2)*(0.2 + 1.5/values['avgTier'])) + \
+                values['avgSpot'] * 200 + values['avgCap'] * 15 + values['avgDef'] * 15 ))
+            values['WN7'] = max(0, int((1240 - 1040/(min(values['avgTier'], 6))**0.164)*values['avgFrag'] + \
+                values['avgDamage']*530/(184*math.exp(0.24*values['avgTier']) + 130) + \
+                values['avgSpot']*125*(min(values['avgTier'], 3))/3 + min(values['avgDef'], 2.2)*100 + \
+                ((185/(0.17 + math.exp((values['avgWinRate'] - 35)* -0.134))) - 500)*0.45 - \
+                ((5-min(values['avgTier'], 5))*125) / \
+                (1+math.exp((values['avgTier'] - (values['battlesCount']/220)**(3/values['avgTier']))*1.5)) ))                
         else:
             for key in ['avgWinRate', 'avgDamage', 'avgFrag', 'avgSpot', 'avgDef', 'avgCap', 'avgHitsRate', \
-                'avgEffHitsRate', 'avgAssist', 'avgXP', 'avgOriginalXP', 'avgCredits', 'avgTier', 'avgBattleTier',\
-                'medPlace', 'WN6', 'XWN6', 'EFF', 'XEFF']:
+                'avgEffHitsRate', 'avgAssist', 'avgXP', 'avgOriginalXP', 'avgPremXP', 'avgCredits', 'avgTier', \
+                'avgBattleTier', 'medPlace', 'WN6', 'XWN6', 'EFF', 'XEFF', 'BR', 'WN7']:
                 values[key] = 0
             for key in expKeys:
                 values[key] = 1
@@ -419,81 +490,103 @@ class SessionStatistic(object):
         values['WN8'] = 980*values['rDAMAGEc'] + 210*values['rDAMAGEc']*values['rFRAGc'] + \
             155*values['rFRAGc']*values['rSPOTc'] + 75*values['rDEFc']*values['rFRAGc'] + \
             145*min(1.8, values['rWINc'])
-        values['XWN8'] = 100 if values['WN8'] > 3250 \
-            else int(max(min(values['WN8']*(values['WN8']*(values['WN8']*(values['WN8']*(values['WN8']*\
-            (0.0000000000000000000812*values['WN8'] + 0.0000000000000001616) - 0.000000000006736) +\
-            0.000000028057) - 0.00004536) + 0.06563) - 0.01, 100), 0))
+        values['XWN8'] = 100 if values['WN8'] > 3650 \
+            else int(max(min(values['WN8']*(values['3800']*(values['WN8']*(values['WN8']*(values['WN8']*\
+            (-0.00000000000000000009762*values['WN8'] + 0.0000000000000016221) - 0.00000000001007) +\
+            0.000000027916) - 0.000036982) + 0.05577) - 1.3, 100), 0))
         values['WN8'] = int(values['WN8'])
         values['avgDamage'] = int(values['avgDamage'])
-        self.refreshColorMacros(values, gradient, palette)
-
-    def num2Str(self, val):
-        sVal = format(val, ',.2f') if type(val) is float \
-            else format(val, ',d')
+        (gradient, palette) = self.refreshColorMacros(values)
+        return (values, gradient, palette)
+        
+    def applyMacros(self, val, prec = 2):
+        if type(val) == str:
+            return val
+        if prec <= 0:
+            return format(int(round(val)), ',d')
+        sVal = format(val, ',.%sf' % prec) \
+            if type(val) is float else format(val, ',d')
         sVal = sVal.replace(',', ' ')
         return sVal
 
-    def num2Strd(self, val):
-        sVal = format(int(round(val)), ',d')
-        sVal = sVal.replace(',', ' ')
-        return sVal
-
-    def num2Str1f(self, val):
-        sVal = format(val, ',.1f')
-        sVal = sVal.replace(',', ' ')
-        return sVal
+    def formatString(self, text, values, gradient, palette):
+        for key in values.keys():
+            text = text.replace('{{%s}}' % key, self.applyMacros(values[key]))
+            text = text.replace('{{%s:d}}' % key, self.applyMacros(values[key], 0))
+            text = text.replace('{{%s:1f}}' % key, self.applyMacros(values[key], 1))
+            text = text.replace('{{g:%s}}' % key, gradient[key])
+            text = text.replace('{{c:%s}}' % key, palette[key])
+        return text
 
     def updateMessage(self):
         if not self.configIsValid:
             self.message = 'stat_config.json is not valid'
             return
-        self.calcWN8(self.battles, self.values, self.gradient, self.palette)
+        (self.values, self.gradient, self.palette) = self.calcWN8(self.battles)
+        bg = self.config.get('bgIcon', '')
+        self.bgIcon = self.formatString(bg, self.values, self.gradient, self.palette)
         msg = '\n'.join(self.config.get('template',''))
-        for key in self.values.keys():
-            msg = msg.replace('{{%s}}' % key, self.num2Str(self.values[key]))
-            msg = msg.replace('{{%s:d}}' % key, self.num2Strd(self.values[key]))
-            msg = msg.replace('{{%s:1f}}' % key, self.num2Str1f(self.values[key]))
-            msg = msg.replace('{{g:%s}}' % key, self.gradient[key])
-            msg = msg.replace('{{c:%s}}' % key, self.palette[key])
-        self.message = msg
+        msg = self.formatString(msg, self.values, self.gradient, self.palette)
+        self.messageGeneral = msg
+        msg = self.config.get('byTankTitle','')
+        tankStat = {}
+        for battle in self.battles:
+            idNum = battle['idNum']
+            if tankStat.has_key(idNum):
+                tankStat[idNum].append(battle)
+            else:
+                tankStat[idNum] = [battle]
+        for idNum in sorted(tankStat.keys(), key = lambda idNum: len(tankStat[idNum]), reverse = True):
+            row = self.config.get('byTankRow','')
+            (values, gradient, palette) = self.calcWN8(tankStat[idNum])
+            vt = vehiclesWG.getVehicleType(idNum)
+            row = row.replace('{{vehicle}}', vt.shortUserString)
+            name = vt.name.replace(':', '-')
+            row = row.replace('{{vehicle-name}}', name)
+            row = self.formatString(row, values, gradient, palette)
+            msg += '\n' + row 
+        self.messageByTank = msg
 
     def replaceBattleResultMessage(self, message, arenaUniqueID):
         message = unicode(message, 'utf-8')
         if self.config.get('debugBattleResultMessage', False):
             LOG_NOTE(message)
+        basicValues = self.battleStats[arenaUniqueID]['values']
+        extendedValues = self.battleStats[arenaUniqueID]['extendedValues']
+        values = basicValues
+        values.update(extendedValues)
         for pattern in self.battleStatPatterns:
+            try:
+                if not eval(pattern.get('condition')):
+                    continue
+            except:
+                print "[wotstat] Invalid calculation condition " + pattern.get('condition')
+                continue
             message = re.sub(pattern.get('pattern',''), pattern.get('repl',''), message)
         battleStatText = '\n'.join(self.config.get('battleStatText',''))
-        values = self.battleStats[arenaUniqueID]['values']
-        extendedValues = self.battleStats[arenaUniqueID]['extendedValues']
         gradient = self.battleStats[arenaUniqueID]['gradient']
         palette = self.battleStats[arenaUniqueID]['palette']
         message = message + '\n<font color=\'#929290\'>' + battleStatText + '</font>'
-        for key in values.keys():
-            message = message.replace('{{%s}}' % key, self.num2Str(values[key]))
-            message = message.replace('{{%s:d}}' % key, self.num2Strd(values[key]))
-            message = message.replace('{{%s:1f}}' % key, self.num2Str1f(values[key]))
-            message = message.replace('{{g:%s}}' % key, gradient[key])
-            message = message.replace('{{c:%s}}' % key, palette[key])
-        for key in extendedValues.keys():
-            message = message.replace('{{%s}}' % key, self.num2Str(extendedValues[key]))
-            message = message.replace('{{%s:d}}' % key, self.num2Strd(extendedValues[key]))
-            message = message.replace('{{%s:1f}}' % key, self.num2Str1f(extendedValues[key]))
-            message = message.replace('{{g:%s}}' % key, gradient[key])
-            message = message.replace('{{c:%s}}' % key, palette[key])
+        message = self.formatString(message, values, gradient, palette)
         return message
 
     def filterNotificationList(self, item):
         message = item['message'].get('message', '')
-        if type(message) == str:
-            msg = unicode(message, 'utf-8')
+        msg = unicode(message, 'utf-8') if isinstance(message, str) \
+            else message if isinstance(message, unicode) else None
+        if msg:
             for pattern in self.config.get('hideMessagePatterns', []):
                 if re.search(pattern, msg, re.I):
                     return False
         return True
 
     def expandStatNotificationList(self, item):
-        arenaUniqueID = int(item['message'].get('savedID', -1))
+        savedData = item['message'].get('savedData', -1)
+        arenaUniqueID = -1
+        if isinstance(savedData, long):
+            arenaUniqueID = int(savedData)
+        elif isinstance(savedData, tuple):
+            arenaUniqueID = int(savedData[0])
         message = item['message'].get('message', '')
         if arenaUniqueID > 0 and self.battleStats.has_key(arenaUniqueID) and type(message) == str:
             message = self.replaceBattleResultMessage(message, arenaUniqueID)
@@ -534,17 +627,19 @@ def new_nlv_populate(self):
     old_nlv_populate(self)
     self.as_appendMessageS(stat.createMessage())
 
+NotificationListView._populate = new_nlv_populate
+
 old_nlv_onClickAction = NotificationListView.onClickAction
 
 def new_onClickAction(self, typeID, entityID, action):
     if action == 'wotstatReset':
         stat.reset()
+    elif action == 'wotstatSwitchPage':
+        stat.page = 1 - stat.page
     else:
         old_nlv_onClickAction(self, typeID, entityID, action)
 
 NotificationListView.onClickAction = new_onClickAction
-
-NotificationListView._populate = new_nlv_populate
 
 def new_nlv_setNotificationList(self):
     formedList = map(lambda item: item.getListVO(), self._model.collection.getListIterator())
@@ -556,13 +651,21 @@ def new_nlv_setNotificationList(self):
 
 NotificationListView._NotificationListView__setNotificationList = new_nlv_setNotificationList
 
+old_npuv_sendMessageForDisplay = NotificationPopUpViewer._NotificationPopUpViewer__sendMessageForDisplay
+
+def new_npuv_sendMessageForDisplay(self, notification):
+    if stat.config.get('showPopUp', True):
+        old_npuv_sendMessageForDisplay(self, notification)
+
+NotificationPopUpViewer._NotificationPopUpViewer__sendMessageForDisplay = new_npuv_sendMessageForDisplay
+
 old_brf_format = BattleResultsFormatter.format
 
 def new_brf_format(self, message, *args):
     result = old_brf_format(self, message, *args)
     arenaUniqueID = message.data.get('arenaUniqueID', 0)
     stat.queue.put(arenaUniqueID)
-    if hasattr(BigWorld.player(), 'arena'):
+    if stat.config.get('enableBattleEndedMessage', True) and hasattr(BigWorld.player(), 'arena'):
         if BigWorld.player().arena.arenaUniqueID != arenaUniqueID:
             isWinner = message.data.get('isWinner', 0)
             battleEndedMessage = ''
@@ -573,7 +676,8 @@ def new_brf_format(self, message, *args):
             else:
                 battleEndedMessage = stat.config.get('battleEndedMessageDraw', '')
             battleEndedMessage = battleEndedMessage.encode('utf-8')
-            vehicleCompDesc = message.data.get('vehTypeCompDescr', None)
+            playerVehicles = message.data['playerVehicles'].itervalues().next()
+            vehicleCompDesc = playerVehicles['vehTypeCompDescr']
             vt = vehiclesWG.getVehicleType(vehicleCompDesc)
             battleEndedMessage = battleEndedMessage.replace('{{vehicle}}', vt.userString)
             name = vt.name.replace(':', '-')
@@ -581,7 +685,12 @@ def new_brf_format(self, message, *args):
             arenaTypeID = message.data.get('arenaTypeID', 0)
             arenaType = ArenaType.g_cache[arenaTypeID]
             arenaName = i18n.makeString(arenaType.name)
+            xp = message.data.get('xp', 0)
+            credits = message.data.get('credits', 0)
             battleEndedMessage = battleEndedMessage.replace('{{map}}', arenaName)
+            battleEndedMessage = battleEndedMessage.replace('{{map-name}}', arenaType.geometryName)
+            battleEndedMessage = battleEndedMessage.replace('{{xp}}', str(xp))
+            battleEndedMessage = battleEndedMessage.replace('{{credits}}', str(credits))
             MessengerEntry.g_instance.gui.addClientMessage(battleEndedMessage)
     return result
 
